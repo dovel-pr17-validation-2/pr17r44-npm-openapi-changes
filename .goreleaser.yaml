@@ -1,0 +1,98 @@
+version: 2
+project_name: openapi-changes
+before:
+  hooks:
+    # You may remove this if you don't use go modules.
+    - go mod tidy
+builds:
+  - id: default
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - "386"
+  - id: darwin
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids:
+        - darwin
+      sign:
+        certificate: "{{.Env.MACOS_SIGN_P12}}"
+        password: "{{.Env.MACOS_SIGN_PASSWORD}}"
+      notarize:
+        issuer_id: "{{.Env.MACOS_NOTARY_ISSUER_ID}}"
+        key_id: "{{.Env.MACOS_NOTARY_KEY_ID}}"
+        key: "{{.Env.MACOS_NOTARY_KEY}}"
+        wait: true
+        timeout: 20m
+
+homebrew_casks:
+  - repository:
+      owner: pb33f
+      name: homebrew-taps
+
+    commit_author:
+      name: goreleaserbot
+      email: goreleaser@quobix.com
+
+    homepage: "https://pb33f.io/openapi-changes/"
+    description: "The worlds most powerful OpenAPI diffing and change detection engine"
+
+snapshot:
+  version_template: "{{ .Tag }}"
+
+# disabled for now, it works but no-one is really using it, and it's screwing up the npm release.
+#chocolateys:
+#  - name: openapi-changes
+#    owners: Princess Beef Heavy Industries LLC
+#    title: openapi-changes - The world's sexiest OpenAPI diffing and breaking change detector tool.
+#    authors: Princess Beef Heavy Industries LLC
+#    project_url: https://pb33f.io/openapi-changes/
+#    url_template: "https://github.com/pb33f/openapi-changes/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+#    icon_url: 'https://pb33f.io/openapi-changes/openapi-changes-logo.png'
+#    copyright: 2023 Princess Beef Heavy Industries LLC
+#    license_url: https://github.com/pb33f/openapi-changes/blob/main/LICENSE
+#    require_license_acceptance: false
+#    project_source_url: https://github.com/pb33f/openapi-changes/
+#    docs_url: https://pb33f.io/openapi-changes/
+#    bug_tracker_url: https://github.com/pb33f/openapi-changes/issues
+#    tags: openapi openapi3 openapi2 swagger openapi-diff openapi-changes openapi-diffing openapi-diff-tool openapi-diff-engine breaking changes
+#    summary: openapi-changes is the world's sexiest OpenAPI diffing and breaking change detector tool.
+#    description: |
+#      openapi-changes will detect all changes (including breaking changes) between two OpenAPI specifications, or
+#      travel back in time through the history of your OpenAPI specification to how it has changed over time. It has
+#      the world's sexiest UI for exploring diffs and changes between OpenAPI specifications.
+#    release_notes: "https://github.com/pb33f/openapi-changes/releases/tag/v{{ .Version }}"
+#    api_key: '{{ .Env.CHOCOLATEY_API_KEY }}'
+#    source_repo: "https://push.chocolatey.org/"
+#    skip_publish: false
+#    goamd64: v1

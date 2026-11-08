@@ -1,0 +1,142 @@
+name: Publish
+
+on:
+  repository_dispatch:
+    types: [publish-event]
+
+jobs:
+  release_and_brew:
+    name: Release and bump homebrew version
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout code from repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Build report UI
+        run: npm ci && npm run build
+        working-directory: html-report/ui
+
+      - name: Verify embedded UI bundles are committed
+        run: |
+          status="$(git status --porcelain --untracked-files=all -- html-report/ui/build/static)"
+          test -z "$status" || { echo "$status"; exit 1; }
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+
+  publish_npm:
+    name: Publish to NPM
+    needs: release_and_brew
+    # npm trusted publishing currently requires a GitHub-hosted runner.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Check version
+        run: echo "Version ${{ github.event.client_payload.new-tag }}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org/
+
+      - name: Bump NPM version
+        run: npm --no-git-tag-version --allow-same-version version ${{ github.event.client_payload.new-tag }}
+
+      - name: NPM publish
+        run: npm publish --access public --provenance
+
+  push_to_registries:
+    if: success() || failure()
+    name: Push Docker image to multiple registries
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            pb33f/openapi-changes
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ github.event.client_payload.new-tag }}
+            type=raw,value=latest
+
+      - name: Capture Docker build metadata
+        id: docker_build_meta
+        run: |
+          echo "version=${{ github.event.client_payload.new-tag }}" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.docker_build_meta.outputs.version }}
+            APP_COMMIT=${{ steps.docker_build_meta.outputs.commit }}
+            APP_DATE=${{ steps.docker_build_meta.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

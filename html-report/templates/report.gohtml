@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en" theme="dark" class="sl-theme-dark">
+{{- template "header" . -}}
+<body>
+<div class="preloader" id="preloader">
+    <div class="ellipsis">
+        <div></div>
+        <div></div>
+        <div></div>
+        <div></div>
+    </div>
+    <br/>
+    OPENAPI-CHANGES report is loading...
+</div>
+<div id="app"></div>
+<script type="application/json" id="report-data">
+{{ .Report }}
+</script>
+<script>
+    {{ .BundledJS }}
+</script>
+</body>
+</html>

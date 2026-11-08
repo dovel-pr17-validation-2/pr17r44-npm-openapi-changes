@@ -1,0 +1,260 @@
+// Copyright 2023-2026 Princess Beef Heavy Industries, LLC / Dave Shanley
+// SPDX-License-Identifier: Apache-2.0
+
+package cmd
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/pb33f/doctor/changerator/renderer"
+	"github.com/pb33f/doctor/terminal"
+	whatChangedModel "github.com/pb33f/libopenapi/what-changed/model"
+	"github.com/pb33f/openapi-changes/internal/changecounts"
+	"github.com/pb33f/openapi-changes/model"
+	"github.com/pmezard/go-difflib/difflib"
+	"github.com/spf13/cobra"
+)
+
+func printMarkdownReportUsage(palette terminal.Palette) {
+	printCommandUsage("markdown-report",
+		"Generates a detailed markdown report of API changes using the doctor changerator engine.",
+		palette)
+}
+
+// renderCommitMarkdown runs the doctor changerator on a single commit and returns markdown.
+// Returns (markdown, nil) on success, ("", nil) for no changes, ("", err) for failures.
+func renderCommitMarkdown(commit *model.Commit, breakingConfig *whatChangedModel.BreakingRulesConfig) (string, error) {
+	result, err := runChangerator(commit, breakingConfig)
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	defer result.Release()
+	deduplicatedChanges := changecounts.Deduplicate(result.DocChanges.GetAllChanges())
+
+	markdown, err := renderer.NewHTMLRenderer(renderer.DefaultRenderConfig()).RenderMarkdown(&renderer.RenderInput{
+		ChangeReport:        result.DocChanges,
+		Doctor:              result.RightDrDoc,
+		RightDocContent:     commit.Data,
+		DeduplicatedChanges: deduplicatedChanges,
+		Config:              renderer.DefaultRenderConfig(),
+	})
+	if err != nil {
+		return "", err
+	}
+	return markdown, nil
+}
+
+// generateUnifiedDiff produces a unified diff between original and modified strings.
+func generateUnifiedDiff(original, modified string) string {
+	diff := difflib.UnifiedDiff{
+		A:        difflib.SplitLines(original),
+		B:        difflib.SplitLines(modified),
+		FromFile: "Original",
+		ToFile:   "Modified",
+		Context:  3,
+	}
+	text, err := difflib.GetUnifiedDiffString(diff)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to generate diff: %s\n", err)
+		return ""
+	}
+	return text
+}
+
+func isSyntheticLeftRightCommit(commit *model.Commit) bool {
+	if commit == nil {
+		return false
+	}
+	return commit.Synthetic
+}
+
+// generateMarkdownReport assembles markdown from all commits.
+// Returns (nil, nil) if no commits produce changes and no errors occurred.
+// Returns (nil, err) if every candidate commit fails to render.
+// Returns (bytes, nil) when at least one commit renders successfully; failed
+// commits are logged to stderr and skipped.
+func generateMarkdownReport(commits []*model.Commit, breakingConfig *whatChangedModel.BreakingRulesConfig, includeDiff bool) ([]byte, error) {
+	defer releaseHistoryWindows(commits)
+	var sb strings.Builder
+	successCount := 0
+	comparedCount := 0
+	var renderErrors []error
+	apiLabel := ""
+	includeCommitMetadata := true
+
+	for i, commit := range commits {
+		markdown, err := renderCommitMarkdown(commit, breakingConfig)
+		if err != nil {
+			emitCommitWarning(commit, err)
+			renderErrors = append(renderErrors, wrapCommitError(commit, err))
+			continue
+		}
+		if commit.Comparable() {
+			comparedCount++
+		}
+		if markdown == "" {
+			continue
+		}
+
+		apiLabel = mergeAPILabel(apiLabel, commit.APILabel())
+		successCount++
+		if successCount == 1 {
+			includeCommitMetadata = !isSyntheticLeftRightCommit(commit)
+		}
+
+		if includeCommitMetadata {
+			sb.WriteString(fmt.Sprintf("## Commit %d: %s\n\n", i+1, commit.Message))
+			sb.WriteString(fmt.Sprintf("- **Hash**: %s\n", commit.Hash))
+			sb.WriteString(fmt.Sprintf("- **Author**: %s\n", commit.Author))
+			sb.WriteString(fmt.Sprintf("- **Date**: %s\n\n", commit.CommitDate.Format(time.RFC3339)))
+		}
+
+		// Strip the doctor heading prefix
+		content := markdown
+		if strings.HasPrefix(content, "# What Changed Report\n\n") {
+			content = strings.TrimPrefix(content, "# What Changed Report\n\n")
+		}
+		sb.WriteString(content)
+		sb.WriteString("\n")
+
+		if includeDiff && len(commit.OldData) > 0 && len(commit.Data) > 0 {
+			diffText := generateUnifiedDiff(string(commit.OldData), string(commit.Data))
+			if diffText != "" {
+				sb.WriteString("<details>\n")
+				sb.WriteString("<summary>Unified Diff</summary>\n\n")
+				sb.WriteString("````diff\n")
+				sb.WriteString(diffText)
+				sb.WriteString("````\n\n")
+				sb.WriteString("</details>\n\n")
+			}
+		}
+
+		sb.WriteString("---\n\n")
+	}
+
+	if comparedCount == 0 && len(renderErrors) > 0 {
+		return nil, fmt.Errorf("all %d commits failed to render: %w", len(renderErrors), errors.Join(renderErrors...))
+	}
+	if len(renderErrors) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d commits failed to render\n", len(renderErrors))
+	}
+	if successCount == 0 {
+		return nil, nil
+	}
+	// The title waits for every commit because history can change format between revisions.
+	header := fmt.Sprintf("# %s Changes Report\n\n*Generated: %s*\n\n", apiLabel, time.Now().Format(time.RFC3339))
+	return []byte(header + sb.String()), nil
+}
+
+// mergeAPILabel keeps a shared format label and falls back to a neutral one when formats mix.
+func mergeAPILabel(current, next string) string {
+	if current == "" || current == next {
+		return next
+	}
+	return "API"
+}
+
+func GetMarkdownReportCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		SilenceUsage: true,
+		Use:          "markdown-report",
+		Short:        "Generate a markdown report",
+		Long:         "Generate a detailed markdown report of API changes rendered as markdown",
+		Example:      "openapi-changes markdown-report HEAD~1:openapi.yaml ./openapi.yaml",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			compact, _ := cmd.Flags().GetBool("compact")
+			resultFile, _ := cmd.Flags().GetString("result-file")
+			reportFile, _ := cmd.Flags().GetString("report-file")
+			includeDiff, _ := cmd.Flags().GetBool("include-diff")
+			if err := validateCompactOptions(args, compact, includeDiff, reportFile, resultFile); err != nil {
+				return err
+			}
+			input, err := prepareCommandRun(cmd, args, printMarkdownReportUsage)
+			if err != nil {
+				return err
+			}
+			if input == nil {
+				return nil
+			}
+			styles := commandStylesFor(input.Opts.palette)
+
+			if compact {
+				report, outcome, err := generateCompactMarkdown(input.Commits, input.BreakingConfig)
+				if err != nil {
+					return err
+				}
+				if err := writeReportFile(reportFile, report, styles); err != nil {
+					return err
+				}
+				if resultFile != "" {
+					data, err := json.Marshal(outcome)
+					if err != nil {
+						return err
+					}
+					return os.WriteFile(resultFile, append(data, '\n'), 0600)
+				}
+				return nil
+			}
+
+			report, err := generateMarkdownReport(input.Commits, input.BreakingConfig, includeDiff)
+			if err != nil {
+				return err
+			}
+
+			if report == nil {
+				printNoChangesText()
+				return nil
+			}
+			return writeReportFile(reportFile, report, styles)
+		},
+	}
+	addTerminalThemeFlags(cmd)
+	cmd.Flags().StringP("report-file", "", "report.md", "The name of the Markdown report file (defaults to 'report.md')")
+	cmd.Flags().Bool("compact", false, "Write a short Markdown report for a direct left/right comparison")
+	cmd.Flags().String("result-file", "", "Write completed comparison counts as JSON (requires --compact)")
+	cmd.Flags().Bool("include-diff", false, "Include a collapsible unified diff of the raw spec for each commit")
+	return cmd
+}
+
+func validateCompactOptions(args []string, compact, includeDiff bool, reportFile, resultFile string) error {
+	if resultFile != "" && !compact {
+		return errors.New("--result-file requires --compact")
+	}
+	if !compact {
+		return nil
+	}
+	if len(args) != 2 {
+		return errors.New("--compact requires two direct comparison inputs; history is not supported")
+	}
+	if info, err := os.Stat(args[0]); err == nil && info.IsDir() {
+		return errors.New("--compact does not support repository history")
+	}
+	if includeDiff {
+		return errors.New("--compact cannot be combined with --include-diff")
+	}
+	if resultFile != "" {
+		reportPath, err := filepath.Abs(reportFile)
+		if err != nil {
+			return err
+		}
+		resultPath, err := filepath.Abs(resultFile)
+		if err != nil {
+			return err
+		}
+		reportInfo, reportErr := os.Stat(reportPath)
+		resultInfo, resultErr := os.Stat(resultPath)
+		if reportPath == resultPath || (reportErr == nil && resultErr == nil && os.SameFile(reportInfo, resultInfo)) {
+			return errors.New("--report-file and --result-file must be different files")
+		}
+	}
+	return nil
+}

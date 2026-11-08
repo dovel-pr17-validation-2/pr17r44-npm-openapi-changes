@@ -1,0 +1,83 @@
+// Copyright 2023-2026 Princess Beef Heavy Industries, LLC / Dave Shanley
+// SPDX-License-Identifier: Apache-2.0
+
+package cmd
+
+import (
+	"testing"
+
+	"github.com/pb33f/testify/assert"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+func flagNames(cmd *cobra.Command) map[string]bool {
+	names := make(map[string]bool)
+	cmd.LocalFlags().VisitAll(func(flag *pflag.Flag) {
+		names[flag.Name] = true
+	})
+	return names
+}
+
+func TestCanonicalCommandLocalFlags(t *testing.T) {
+	assert.Equal(t, map[string]bool{
+		"no-color":      true,
+		"roger-mode":    true,
+		"tektronix":     true,
+		"markdown":      true,
+		"with-lines":    true,
+		"error-on-diff": true,
+	}, flagNames(GetSummaryCommand()))
+
+	assert.Equal(t, map[string]bool{
+		"no-color":     true,
+		"roger-mode":   true,
+		"reproducible": true,
+		"tektronix":    true,
+	}, flagNames(GetReportCommand()))
+
+	assert.Equal(t, map[string]bool{
+		"no-color":     true,
+		"roger-mode":   true,
+		"tektronix":    true,
+		"report-file":  true,
+		"include-diff": true,
+		"compact":      true,
+		"result-file":  true,
+	}, flagNames(GetMarkdownReportCommand()))
+
+	assert.Equal(t, map[string]bool{
+		"no-color":    true,
+		"roger-mode":  true,
+		"tektronix":   true,
+		"report-file": true,
+		"no-explorer": true,
+	}, flagNames(GetHTMLReportCommand()))
+
+	assert.Equal(t, map[string]bool{
+		"no-color":   true,
+		"roger-mode": true,
+		"tektronix":  true,
+	}, flagNames(GetConsoleCommand()))
+}
+
+func TestRootPersistentFlagsRemainAvailable(t *testing.T) {
+	root := testRootCmd(GetSummaryCommand())
+	names := make(map[string]bool)
+	root.PersistentFlags().VisitAll(func(flag *pflag.Flag) {
+		names[flag.Name] = true
+	})
+
+	assert.Equal(t, map[string]bool{
+		"no-logo":          true,
+		"top":              true,
+		"limit":            true,
+		"limit-time":       true,
+		"base":             true,
+		"base-commit":      true,
+		"remote":           true,
+		"ext-refs":         true,
+		"config":           true,
+		"global-revisions": true,
+	}, names)
+}

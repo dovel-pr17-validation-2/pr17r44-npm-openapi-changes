@@ -1,0 +1,220 @@
+// Copyright 2023-2026 Princess Beef Heavy Industries, LLC / Dave Shanley
+// SPDX-License-Identifier: Apache-2.0
+
+package cmd
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/pb33f/doctor/terminal"
+	"github.com/pb33f/go-yaml"
+	"github.com/pb33f/libopenapi/what-changed/model"
+	"github.com/pb33f/openapi-changes/internal/breakingrules"
+)
+
+const (
+	// DefaultConfigFileName is the default name for the breaking rules config file
+	DefaultConfigFileName = "changes-rules.yaml"
+)
+
+// LoadBreakingRulesConfig loads a breaking rules configuration from the specified path.
+// If configPath is empty, it searches default locations (current directory, then ~/.config).
+// Returns nil config if no config is found in default locations (uses libopenapi defaults).
+// Returns error if user-specified config path doesn't exist or has invalid YAML.
+func LoadBreakingRulesConfig(configPath string) (*model.BreakingRulesConfig, error) {
+	// If user specified a config path, it must exist
+	if configPath != "" {
+		return loadConfigFromPath(configPath, true)
+	}
+
+	// Check default locations
+	defaultPaths := getDefaultConfigPaths()
+	for _, path := range defaultPaths {
+		config, err := loadConfigFromPath(path, false)
+		if err != nil {
+			// Return error only for YAML parsing errors, not for missing files
+			return nil, err
+		}
+		if config != nil {
+			return config, nil
+		}
+	}
+
+	// No config found in default locations - return nil to use libopenapi defaults
+	return nil, nil
+}
+
+// loadConfigFromPath loads config from a specific path.
+// If required is true, returns error if file doesn't exist.
+// If required is false, returns nil, nil if file doesn't exist.
+func loadConfigFromPath(configPath string, required bool) (*model.BreakingRulesConfig, error) {
+	// Expand ~ to home directory
+	expandedPath, err := expandUserPath(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to expand config path '%s': %w", configPath, err)
+	}
+
+	_, err = os.Stat(expandedPath)
+	if os.IsNotExist(err) {
+		if required {
+			return nil, fmt.Errorf("config file not found: %s", expandedPath)
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to access config file '%s': %w", expandedPath, err)
+	}
+
+	data, err := os.ReadFile(expandedPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file '%s': %w", expandedPath, err)
+	}
+
+	// Validate config structure before parsing
+	if validationResult := model.ValidateBreakingRulesConfigYAML(data); validationResult != nil {
+		return nil, &ConfigValidationError{
+			FilePath: expandedPath,
+			Result:   validationResult,
+		}
+	}
+
+	var config model.BreakingRulesConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return nil, &ConfigParseError{
+			FilePath: expandedPath,
+			Err:      err,
+		}
+	}
+
+	return &config, nil
+}
+
+// getDefaultConfigPaths returns the list of default paths to search for config files.
+// order: current directory, then ~/.config
+// silently skips paths if directory cannot be resolved
+func getDefaultConfigPaths() []string {
+	paths := make([]string, 0, 2)
+
+	cwd, err := os.Getwd()
+	if err == nil {
+		paths = append(paths, filepath.Join(cwd, DefaultConfigFileName))
+	}
+
+	home, err := os.UserHomeDir()
+	if err == nil {
+		paths = append(paths, filepath.Join(home, ".config", DefaultConfigFileName))
+	}
+
+	return paths
+}
+
+// expandUserPath expands ~ to the user's home directory
+func expandUserPath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	if strings.HasPrefix(path, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("unable to resolve home directory: %w", err)
+		}
+		if path == "~" {
+			return home, nil
+		}
+		if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+			return filepath.Join(home, path[2:]), nil
+		}
+	}
+
+	return path, nil
+}
+
+// ApplyBreakingRulesConfig sets the active breaking rules config in libopenapi.
+// Thread-safe — delegates to internal/breakingrules which guards with a mutex.
+func ApplyBreakingRulesConfig(config *model.BreakingRulesConfig) {
+	breakingrules.Apply(config)
+}
+
+// ResetBreakingRulesConfig resets the active breaking rules to libopenapi defaults.
+// Thread-safe — delegates to internal/breakingrules which guards with a mutex.
+func ResetBreakingRulesConfig() {
+	breakingrules.Reset()
+}
+
+// ConfigParseError represents a YAML parsing error with context
+type ConfigParseError struct {
+	FilePath string
+	Err      error
+}
+
+func (e *ConfigParseError) Error() string {
+	return fmt.Sprintf("failed to parse config file '%s': %v", e.FilePath, e.Err)
+}
+
+func (e *ConfigParseError) Unwrap() error {
+	return e.Err
+}
+
+// ConfigValidationError represents validation errors in the config structure
+type ConfigValidationError struct {
+	FilePath string
+	Result   *model.ConfigValidationResult
+}
+
+func (e *ConfigValidationError) Error() string {
+	return fmt.Sprintf("config validation failed for '%s': %d error(s) found", e.FilePath, len(e.Result.Errors))
+}
+
+// PrintConfigError prints a config error with nice formatting using lipgloss (no pterm).
+func PrintConfigError(err error, palette terminal.Palette) {
+	red := styleWithForeground(palette.Breaking).Bold(true)
+	yellow := styleWithForeground(palette.Modification)
+	info := styleWithForeground(palette.Primary)
+
+	fmt.Println()
+
+	var validationErr *ConfigValidationError
+	if errors.As(err, &validationErr) {
+		fmt.Println(red.Render(fmt.Sprintf("ERROR: Breaking rules config has %d error(s)", len(validationErr.Result.Errors))))
+		fmt.Println()
+		fmt.Println(red.Render(fmt.Sprintf("  File: %s", validationErr.FilePath)))
+		fmt.Println()
+
+		for _, e := range validationErr.Result.Errors {
+			if e.Line > 0 {
+				fmt.Println(red.Render(fmt.Sprintf("  ✗ Line %d: %s", e.Line, e.Message)))
+			} else {
+				fmt.Println(red.Render(fmt.Sprintf("  ✗ %s", e.Message)))
+			}
+			fmt.Println(yellow.Render(fmt.Sprintf("    → Move '%s' to the top level of your config", e.FoundKey)))
+			fmt.Println()
+		}
+
+		fmt.Println(info.Render("  Components like 'discriminator', 'xml', 'contact', 'license', etc."))
+		fmt.Println(info.Render("  must be defined at the top level, not nested under other components."))
+		fmt.Println(info.Render("  See: https://pb33f.io/libopenapi/what-changed/"))
+		fmt.Println()
+		return
+	}
+
+	var parseErr *ConfigParseError
+	if errors.As(err, &parseErr) {
+		fmt.Println(red.Render("ERROR: Failed to parse breaking rules config file"))
+		fmt.Println()
+		fmt.Println(red.Render(fmt.Sprintf("  File: %s", parseErr.FilePath)))
+		fmt.Println(red.Render(fmt.Sprintf("  Error: %s", parseErr.Err.Error())))
+		fmt.Println()
+		fmt.Println(yellow.Render("  Ensure the YAML structure matches libopenapi's BreakingRulesConfig format."))
+		fmt.Println(yellow.Render("  See: https://pb33f.io/libopenapi/what-changed/"))
+		fmt.Println()
+		return
+	}
+
+	fmt.Println(red.Render(fmt.Sprintf("ERROR: Config error: %s", err.Error())))
+	fmt.Println()
+}

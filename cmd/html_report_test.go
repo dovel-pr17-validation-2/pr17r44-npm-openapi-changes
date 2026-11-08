@@ -1,0 +1,367 @@
+// Copyright 2023-2026 Princess Beef Heavy Industries, LLC / Dave Shanley
+// SPDX-License-Identifier: Apache-2.0
+
+package cmd
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	whatChangedModel "github.com/pb33f/libopenapi/what-changed/model"
+	htmlReport "github.com/pb33f/openapi-changes/html-report"
+	"github.com/pb33f/openapi-changes/model"
+	"github.com/pb33f/testify/assert"
+	"github.com/pb33f/testify/require"
+)
+
+func TestGenerateHTMLReport_UnchangedLeftRight(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+
+	report, err := generateHTMLReport(commits, nil, false,
+		"../sample-specs/petstorev3.json",
+		"../sample-specs/petstorev3.json",
+	)
+	require.NoError(t, err)
+	assert.Nil(t, report)
+}
+
+func TestGenerateHTMLReport_LeftRightIncludesSanitizedPaths(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+
+	report, err := generateHTMLReport(commits, nil, true,
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+
+	content := string(report)
+	assert.Contains(t, content, `"originalPath":"petstorev3-original.json"`)
+	assert.Contains(t, content, `"modifiedPath":"petstorev3.json"`)
+	assert.Contains(t, content, "<!DOCTYPE html")
+}
+
+func TestGenerateHTMLReport_LeftRightPreservesGitRefPaths(t *testing.T) {
+	repoDir := createGitSpecRepo(t)
+	chdirForTest(t, repoDir)
+
+	commits, err := loadLeftRightCommits(
+		"HEAD~1:openapi.yaml",
+		"HEAD:openapi.yaml",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+
+	report, err := generateHTMLReport(commits, nil, true,
+		"HEAD~1:openapi.yaml",
+		"HEAD:openapi.yaml",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+
+	content := string(report)
+	assert.Contains(t, content, `"originalPath":"HEAD~1:openapi.yaml"`)
+	assert.Contains(t, content, `"modifiedPath":"HEAD:openapi.yaml"`)
+}
+
+func TestGenerateHTMLReport_GitHistoryBasePathUsesRevisionScopedSiblingRefs(t *testing.T) {
+	repoDir, fileName := createMovedRefGitSpecRepo(t)
+
+	commits, err := loadGitHistoryCommits(repoDir, fileName, summaryOpts{base: repoDir, noColor: true, limitTime: -1}, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	report, err := generateHTMLReport(commits, nil, true, repoDir, fileName)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+
+	content := string(report)
+	assert.Contains(t, content, "<!DOCTYPE html")
+	assert.Contains(t, content, `"property":"$ref"`)
+	assert.Contains(t, content, `"path":"$.paths['/thing'].get.responses['200'].content['application/json'].schema"`)
+	assert.NotContains(t, content, `"origin":"`+repoDir)
+}
+
+func TestGenerateHTMLReport_LeftRightSanitizesURLPaths(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/left.yaml" {
+			_, _ = w.Write([]byte("openapi: 3.0.3\ninfo:\n  title: Left\n  version: '1.0'\npaths: {}\n"))
+			return
+		}
+		_, _ = w.Write([]byte("openapi: 3.0.3\ninfo:\n  title: Right\n  version: '1.1'\npaths:\n  /pets:\n    get:\n      responses:\n        \"200\":\n          description: ok\n"))
+	}))
+	defer server.Close()
+
+	leftURL := server.URL + "/left.yaml?token=left-secret#frag"
+	rightURL := server.URL + "/right.yaml?token=right-secret#frag"
+
+	commits, err := loadLeftRightCommits(leftURL, rightURL, summaryOpts{noColor: true})
+	require.NoError(t, err)
+
+	report, err := generateHTMLReport(commits, nil, true, leftURL, rightURL)
+	require.NoError(t, err)
+	require.NotNil(t, report)
+
+	content := string(report)
+	assert.Contains(t, content, `"originalPath":"`+server.URL+`/left.yaml"`)
+	assert.Contains(t, content, `"modifiedPath":"`+server.URL+`/right.yaml"`)
+	assert.NotContains(t, content, "left-secret")
+	assert.NotContains(t, content, "right-secret")
+}
+
+func TestBuildHTMLReportItems_AllCommitsFail(t *testing.T) {
+	items, err := buildHTMLReportItems([]*model.Commit{makeSwagger2Commit(t)}, nil)
+	require.Error(t, err)
+	assert.Nil(t, items)
+	assert.Contains(t, err.Error(), "all 1 commits failed to build report items")
+}
+
+func TestBuildHTMLReportItems_LeftRightModelBuildErrorNamesFiles(t *testing.T) {
+	leftPath, rightPath := createBrokenReferenceSpecPair(t)
+
+	commits, err := loadLeftRightCommits(leftPath, rightPath, summaryOpts{noColor: true})
+	require.NoError(t, err)
+
+	var buildErr error
+	stderr := captureStderr(t, func() {
+		_, buildErr = buildHTMLReportItems(commits, nil)
+	})
+
+	require.Error(t, buildErr)
+	assert.Contains(t, buildErr.Error(), "all 1 commits failed to build report items")
+	assert.Contains(t, buildErr.Error(), rightPath)
+	assert.Contains(t, buildErr.Error(), "building modified model")
+	assert.Contains(t, stderr, leftPath)
+	assert.Contains(t, stderr, rightPath)
+}
+
+func TestBuildHTMLReportItems_PartialFailureReturnsPartialResults(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	mixed := append(commits, makeSwagger2Commit(t))
+
+	var items []*htmlReport.ReportItem
+	stderr := captureStderr(t, func() {
+		items, err = buildHTMLReportItems(mixed, nil)
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, items, "should return successfully built items despite partial failure")
+	assert.Contains(t, stderr, "warning: commit abc123: building modified model")
+	assert.Contains(t, stderr, "warning: 1 commits failed to build report items")
+}
+
+func TestGenerateHTMLReport_PartialFailureReturnsPartialReport(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	mixed := append(commits, makeSwagger2Commit(t))
+
+	report, err := generateHTMLReport(mixed, nil, false,
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, report, "should return a report with successfully built items despite partial failure")
+}
+
+func TestHTMLReportCommand_LeftRightFiles(t *testing.T) {
+	reportFile := filepath.Join(t.TempDir(), "report.html")
+	cmd := testRootCmd(GetHTMLReportCommand(),
+		"--no-logo", "--no-color",
+		"--report-file", reportFile,
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+	)
+
+	err := cmd.Execute()
+	require.NoError(t, err)
+	assert.FileExists(t, reportFile)
+}
+
+func TestHTMLReportCommand_SingleArgNonGithub(t *testing.T) {
+	cmd := testRootCmd(GetHTMLReportCommand(), "--no-logo", "--no-color", "not-a-url")
+	err := cmd.Execute()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "github.com URL")
+}
+
+func TestHTMLReportCommand_TooManyArgs(t *testing.T) {
+	cmd := testRootCmd(GetHTMLReportCommand(), "--no-logo", "a", "b", "c")
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "too many arguments"))
+}
+
+func TestBuildHTMLReportItems_PreservesSchemaNodesInDocumentTree(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	items, err := buildHTMLReportItems(commits, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, items)
+
+	target := &newHtmlNodeGraph{}
+	require.NotNil(t, items[0].Graph)
+	require.NoError(t, json.Unmarshal(items[0].Graph.Nodes, &target.Nodes))
+	require.NoError(t, json.Unmarshal(items[0].Graph.NodeChangeTree, &target.Root))
+
+	nodeIDs := make(map[string]struct{})
+	for _, node := range target.Nodes {
+		id, _ := node["id"].(string)
+		if id != "" {
+			nodeIDs[id] = struct{}{}
+		}
+	}
+
+	assert.Contains(t, nodeIDs, "$.components")
+	assert.Contains(t, nodeIDs, "$.components.schemas['Pet']")
+	assert.Contains(t, nodeIDs, "$.components.schemas['User']")
+
+	rootChildren, ok := target.Root["nodes"].([]any)
+	require.True(t, ok)
+
+	rootChildIDs := make([]string, 0, len(rootChildren))
+	for _, child := range rootChildren {
+		if id, ok := child.(string); ok {
+			rootChildIDs = append(rootChildIDs, id)
+		}
+	}
+	assert.Contains(t, rootChildIDs, "$.components")
+}
+
+func TestBuildHTMLReportItems_SplitsStandardAndChangeExplorerGraphs(t *testing.T) {
+	commits, err := loadLeftRightCommits(
+		"../sample-specs/petstorev3-original.json",
+		"../sample-specs/petstorev3.json",
+		summaryOpts{noColor: true},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	items, err := buildHTMLReportItems(commits, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, items)
+
+	item := items[0]
+	require.NotNil(t, item.Graph)
+	require.NotNil(t, item.ExplorerGraph)
+
+	assert.Equal(t, "standard", item.Graph.Mode)
+	assert.Equal(t, "change", item.ExplorerGraph.Mode)
+	assert.NotEmpty(t, item.Graph.NodeChangeTree, "raw document tree must stay on the standard graph")
+	assert.Empty(t, item.ExplorerGraph.NodeChangeTree, "change explorer graph should not transport the raw tree")
+	assert.NotEmpty(t, item.Graph.Changes, "standard graph should preserve deduplicated changes")
+	assert.Empty(t, item.ExplorerGraph.Changes, "change explorer graph should not duplicate the change list")
+
+	var standardNodes []map[string]any
+	var explorerNodes []map[string]any
+	require.NoError(t, json.Unmarshal(item.Graph.Nodes, &standardNodes))
+	require.NoError(t, json.Unmarshal(item.ExplorerGraph.Nodes, &explorerNodes))
+	require.NotEmpty(t, standardNodes)
+	require.NotEmpty(t, explorerNodes)
+
+	var standardNodeWithInstance map[string]any
+	for _, node := range standardNodes {
+		if _, ok := node["instance"]; ok {
+			standardNodeWithInstance = node
+			break
+		}
+	}
+	var explorerNodeWithChildChanges map[string]any
+	for _, node := range explorerNodes {
+		if _, ok := node["childChanges"]; ok {
+			explorerNodeWithChildChanges = node
+			break
+		}
+	}
+
+	require.NotNil(t, standardNodeWithInstance)
+	require.NotNil(t, explorerNodeWithChildChanges)
+	assert.Contains(t, standardNodeWithInstance, "instance", "standard graph nodes render semantic bodies")
+	assert.Contains(t, explorerNodeWithChildChanges, "childChanges", "change explorer nodes render change summaries")
+}
+
+func TestBuildHTMLReportItems_GitHistoryRewritesGraphOriginsToRepoRelativePaths(t *testing.T) {
+	repoDir, fileName := createMovedRefGitSpecRepo(t)
+
+	commits, err := loadGitHistoryCommits(repoDir, fileName, summaryOpts{base: repoDir, noColor: true, limitTime: -1}, nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	items, err := buildHTMLReportItems(commits, nil)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	var graphNodes []map[string]any
+	require.NoError(t, json.Unmarshal(items[0].Graph.Nodes, &graphNodes))
+
+	var origins []string
+	for _, node := range graphNodes {
+		origin, _ := node["origin"].(string)
+		if origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+
+	require.NotEmpty(t, origins)
+	for _, origin := range origins {
+		assert.NotContains(t, origin, repoDir)
+		assert.False(t, filepath.IsAbs(filepath.FromSlash(origin)), "origin should be repo-relative: %s", origin)
+	}
+}
+
+func TestBuildHTMLReportItems_ComposedSchemaTitleRemovalPreservesPropertyLabel(t *testing.T) {
+	leftPath, rightPath := createComposedSchemaTitleRemovalSpecPair(t, "allOf")
+
+	commits, err := loadLeftRightCommits(leftPath, rightPath, summaryOpts{noColor: true})
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+
+	items, err := buildHTMLReportItems(commits, nil)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	var changes []*whatChangedModel.Change
+	require.NoError(t, json.Unmarshal(items[0].Graph.Changes, &changes))
+	require.Len(t, changes, 1)
+
+	assert.Equal(t, "title", changes[0].Property)
+	assert.Equal(t, "schema", changes[0].Type)
+	assert.Equal(t, "$.components.schemas['Contract']", changes[0].Path)
+	assert.NotContains(t, string(items[0].Graph.Changes), `"property":"anyOf"`)
+}
+
+type newHtmlNodeGraph struct {
+	Nodes []map[string]any
+	Root  map[string]any
+}

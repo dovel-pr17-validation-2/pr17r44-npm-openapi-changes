@@ -1,0 +1,102 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: blacksmith-4vcpu-windows-2025
+    env:
+      GOWORK: off
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test
+        run: go test -v -count=1 -timeout=3m ./...
+
+      - name: Build
+        run: go build -o openapi-changes.exe .
+
+  build:
+    name: Build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      GOWORK: off
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+        id: go
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Build report UI
+        run: npm ci && npm run build
+        working-directory: html-report/ui
+
+      - name: Verify embedded UI bundles are committed
+        run: |
+          status="$(git status --porcelain --untracked-files=all -- html-report/ui/build/static)"
+          test -z "$status" || { echo "$status"; exit 1; }
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: make build
+      - name: Clean modcache
+        run: go clean -modcache
+
+  build-report-ui:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+        name: Checkout repository
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: html-report/ui
+
+      - name: Check types and test report UI
+        run: npm run typecheck && npm test
+        working-directory: html-report/ui
+
+      - name: Build
+        run: npm run build
+        working-directory: html-report/ui
+
+      - name: Verify embedded UI bundles are committed
+        run: |
+          status="$(git status --porcelain --untracked-files=all -- html-report/ui/build/static)"
+          test -z "$status" || { echo "$status"; exit 1; }
